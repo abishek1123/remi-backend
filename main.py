@@ -802,3 +802,78 @@ Their recent tasks:
     contents += "assistant:"
 
     return {"reply": generate_text(contents), "intent": "chat"}
+
+
+class QuizRequest(BaseModel):
+    user_id: str
+    document_id: str
+    num_questions: int = 5
+
+
+@app.post("/generate-quiz")
+def generate_quiz(request: QuizRequest):
+    enforce_rate_limit(request.user_id)
+
+    chunks = fetch_document_chunks(request.document_id, limit=40)
+    if not chunks:
+        raise HTTPException(
+            status_code=400,
+            detail="This document has no readable content to quiz on.",
+        )
+
+    content = "\n\n".join(chunks)
+    n = max(1, min(request.num_questions, 15))
+
+    prompt = f"""You are an expert exam question writer for a college student.
+Using ONLY the study material below, write {n} multiple-choice questions that test real understanding, not trivia.
+
+Rules:
+- Every question and its correct answer MUST be answerable from the material below. Do not use outside knowledge.
+- Exactly 4 options each, exactly one correct.
+- Make the wrong options plausible (common misconceptions), not obviously wrong.
+- Give each question a short "topic" (2-4 words) naming the concept it covers.
+- Add a one-sentence "explanation" of why the correct answer is right.
+
+Return ONLY valid JSON, no markdown, in this exact shape:
+{{
+  "questions": [
+    {{
+      "question": "...",
+      "options": ["...", "...", "...", "..."],
+      "correct_index": 0,
+      "topic": "...",
+      "explanation": "..."
+    }}
+  ]
+}}
+
+Study material:
+{content}
+"""
+
+    parsed = parse_llm_json(generate_text(prompt))
+    if not parsed or not isinstance(parsed.get("questions"), list):
+        raise HTTPException(status_code=502, detail="Could not generate a quiz. Please try again.")
+
+    questions = []
+    for q in parsed["questions"]:
+        if not isinstance(q, dict):
+            continue
+        opts = q.get("options")
+        ci = q.get("correct_index")
+        if not (isinstance(opts, list) and 2 <= len(opts) <= 6):
+            continue
+        if not isinstance(ci, int) or not (0 <= ci < len(opts)):
+            continue
+        questions.append({
+            "question": str(q.get("question", "")).strip(),
+            "options": [str(o) for o in opts],
+            "correct_index": ci,
+            "topic": str(q.get("topic", "General")).strip() or "General",
+            "explanation": str(q.get("explanation", "")).strip(),
+        })
+
+    if not questions:
+        raise HTTPException(status_code=502, detail="Could not generate valid questions. Please try again.")
+
+    return {"questions": questions}
