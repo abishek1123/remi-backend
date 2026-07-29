@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Header, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
@@ -93,10 +93,6 @@ class ParseRequest(BaseModel):
     user_id: str | None = None
 
 
-def resolve_user_id(request: ParseRequest, x_user_id: str | None) -> str | None:
-    return request.user_id or x_user_id
-
-
 def get_usage_count(user_id: str, usage_date: str) -> int:
     if not supabase_url or not supabase_service_role_key:
         raise RuntimeError("Supabase credentials are not configured")
@@ -143,6 +139,52 @@ def save_usage_count(user_id: str, usage_date: str, request_count: int) -> None:
     response.raise_for_status()
 
 
+# --- Authentication: verify the caller's Supabase session token and derive the
+# user id from it, rather than trusting a user_id sent in the request body. ---
+
+_user_cache: dict = {}  # access_token -> (user_id, expiry_epoch)
+_USER_CACHE_TTL = 300  # seconds
+
+
+def get_current_user_id(authorization: str | None = Header(default=None)) -> str:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Sign in required.")
+    token = authorization.split(" ", 1)[1].strip()
+
+    now = time.time()
+    cached = _user_cache.get(token)
+    if cached and cached[1] > now:
+        return cached[0]
+
+    try:
+        resp = requests.get(
+            f"{supabase_url}/auth/v1/user",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "apikey": supabase_service_role_key,
+            },
+            timeout=10,
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Couldn't verify your session right now. Please try again.",
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=401,
+            detail="Your session has expired. Please sign in again.",
+        )
+
+    user_id = resp.json().get("id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid session.")
+
+    _user_cache[token] = (user_id, now + _USER_CACHE_TTL)
+    return user_id
+
+
 def enforce_rate_limit(user_id: str | None) -> None:
     """Per-user daily cap on Gemini-backed requests. Checks + increments in one
     place so every AI endpoint is protected (not just parse-input/assistant).
@@ -167,9 +209,8 @@ def enforce_rate_limit(user_id: str | None) -> None:
 
 
 @app.post("/parse-input")
-def parse_input(request: ParseRequest, x_user_id: str | None = Header(default=None)):
+def parse_input(request: ParseRequest, user_id: str = Depends(get_current_user_id)):
     today = date.today().isoformat()
-    user_id = resolve_user_id(request, x_user_id)
     enforce_rate_limit(user_id)
 
     prompt = f"""Today's date is {today}.
@@ -317,10 +358,10 @@ def get_recent_tasks(user_id: str) -> list[dict]:
 
 
 @app.post("/chat")
-def chat(request: ChatRequest):
-    enforce_rate_limit(request.user_id)
+def chat(request: ChatRequest, user_id: str = Depends(get_current_user_id)):
+    enforce_rate_limit(user_id)
 
-    tasks = get_recent_tasks(request.user_id)
+    tasks = get_recent_tasks(user_id)
     tasks_summary = "\n".join(
         f"- {t['title']} (due: {t.get('due_date') or 'no date'}, status: {t['status']})"
         for t in tasks
@@ -422,7 +463,7 @@ def process_document_chunks(document_id: str, user_id: str, full_text: str) -> N
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    user_id: str = Form(...),
+    user_id: str = Depends(get_current_user_id),
 ):
     enforce_rate_limit(user_id)
 
@@ -468,11 +509,11 @@ class AskDocumentRequest(BaseModel):
 
 
 @app.post("/ask-document")
-def ask_document(request: AskDocumentRequest):
-    enforce_rate_limit(request.user_id)
+def ask_document(request: AskDocumentRequest, user_id: str = Depends(get_current_user_id)):
+    enforce_rate_limit(user_id)
 
     try:
-        matches = retrieve_chunks(request.question, request.user_id, request.document_id)
+        matches = retrieve_chunks(request.question, user_id, request.document_id)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Retrieval failed: {str(e)}")
 
@@ -690,14 +731,14 @@ def parse_llm_json(text: str) -> dict | None:
 
 
 @app.post("/assistant")
-def assistant(request: ChatRequest):
+def assistant(request: ChatRequest, user_id: str = Depends(get_current_user_id)):
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages is required")
-    enforce_rate_limit(request.user_id)
+    enforce_rate_limit(user_id)
 
     today = date.today().isoformat()
     latest = request.messages[-1].content
-    documents = list_user_documents(request.user_id)
+    documents = list_user_documents(user_id)
     docs_listing = "\n".join(
         f'- id: {d["id"]}, title: "{d["title"]}"' for d in documents
     ) or "(no documents uploaded)"
@@ -729,7 +770,7 @@ Rules:
 
     if intent == "add_task" and parsed.get("title"):
         try:
-            insert_task(request.user_id, parsed["title"], latest, parsed.get("due_date"))
+            insert_task(user_id, parsed["title"], latest, parsed.get("due_date"))
         except Exception:
             raise HTTPException(status_code=502, detail="Failed to save task")
         due = parsed.get("due_date")
@@ -758,7 +799,7 @@ Summary:"""
     if intent == "ask_documents":
         question = parsed.get("question") or latest
         try:
-            matches = retrieve_chunks(question, request.user_id, parsed.get("document_id"))
+            matches = retrieve_chunks(question, user_id, parsed.get("document_id"))
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Retrieval failed: {str(e)}")
         if not matches:
@@ -782,7 +823,7 @@ Answer:"""
         return {"reply": answer, "intent": intent}
 
     # Default: companion chat (same behavior as /chat)
-    tasks = get_recent_tasks(request.user_id)
+    tasks = get_recent_tasks(user_id)
     tasks_summary = "\n".join(
         f"- {t['title']} (due: {t.get('due_date') or 'no date'}, status: {t['status']})"
         for t in tasks
@@ -812,8 +853,8 @@ class QuizRequest(BaseModel):
 
 
 @app.post("/generate-quiz")
-def generate_quiz(request: QuizRequest):
-    enforce_rate_limit(request.user_id)
+def generate_quiz(request: QuizRequest, user_id: str = Depends(get_current_user_id)):
+    enforce_rate_limit(user_id)
 
     chunks = fetch_document_chunks(request.document_id, limit=60)
     if not chunks:
