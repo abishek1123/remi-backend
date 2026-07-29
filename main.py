@@ -518,32 +518,18 @@ def ask_document(request: AskDocumentRequest, user_id: str = Depends(get_current
         raise HTTPException(status_code=502, detail=f"Retrieval failed: {str(e)}")
 
     if not matches:
-        return {
-            "answer": "I couldn't find anything relevant in your documents to answer that.",
-            "sources": [],
-        }
+        return {"answer": GROUNDED_REFUSAL, "sources": []}
 
-    context = "\n\n".join(
-        f"[Chunk {m['chunk_index']}] {m['chunk_text']}" for m in matches
-    )
+    answer = answer_from_context(request.question, matches)
 
-    answer = generate_text(
-        f"""Answer the question using ONLY the context below, which was retrieved from the user's uploaded document(s). If the context doesn't contain enough information to answer, say so honestly instead of guessing.
-
-Context:
-{context}
-
-Question: {request.question}
-
-Answer:"""
-    )
-
+    # No citations when the model couldn't ground an answer.
+    grounded = answer.strip().rstrip(".") != GROUNDED_REFUSAL.rstrip(".")
     return {
         "answer": answer,
         "sources": [
             {"document_id": m["document_id"], "chunk_index": m["chunk_index"]}
             for m in matches
-        ],
+        ] if grounded else [],
     }
 
 
@@ -652,6 +638,32 @@ def retrieve_chunks(question: str, user_id: str, document_id: str | None = None,
     if not fused:
         return []
     return _rerank(question, fused[:12], top_n=top_n)
+
+
+GROUNDED_REFUSAL = "I couldn't find this in your documents."
+
+
+def answer_from_context(question: str, matches: list[dict]) -> str:
+    """Generate an answer strictly grounded in the retrieved chunks. If the
+    context doesn't clearly contain the answer, returns a fixed refusal rather
+    than letting the model fall back on outside knowledge (anti-hallucination)."""
+    context = "\n\n".join(
+        f"[Chunk {m['chunk_index']}] {m['chunk_text']}" for m in matches
+    )
+    prompt = f"""You answer questions strictly from the student's own uploaded study material.
+
+Rules:
+- Use ONLY the context below. Do NOT use any outside knowledge.
+- If the context does not clearly and directly contain the answer, reply with EXACTLY this sentence and nothing else: "{GROUNDED_REFUSAL}"
+- Never guess, infer beyond the text, or fabricate. Keep the answer concise.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
+    return generate_text(prompt)
 
 
 def list_user_documents(user_id: str) -> list[dict]:
@@ -803,24 +815,11 @@ Summary:"""
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Retrieval failed: {str(e)}")
         if not matches:
-            return {
-                "reply": "I couldn't find anything relevant in your documents to answer that.",
-                "intent": intent,
-            }
-        context = "\n\n".join(
-            f"[Chunk {m['chunk_index']}] {m['chunk_text']}" for m in matches
-        )
-        answer = generate_text(
-            f"""Answer the question using ONLY the context below, which was retrieved from the user's uploaded document(s). If the context doesn't contain enough information to answer, say so honestly instead of guessing.
-
-Context:
-{context}
-
-Question: {question}
-
-Answer:"""
-        )
-        return {"reply": answer, "intent": intent}
+            return {"reply": GROUNDED_REFUSAL, "intent": intent}
+        return {
+            "reply": answer_from_context(question, matches),
+            "intent": intent,
+        }
 
     # Default: companion chat (same behavior as /chat)
     tasks = get_recent_tasks(user_id)
