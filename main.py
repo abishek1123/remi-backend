@@ -15,6 +15,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 import pdfplumber
 import io
 import time
+import random
 
 load_dotenv()
 firebase_creds_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
@@ -814,15 +815,22 @@ class QuizRequest(BaseModel):
 def generate_quiz(request: QuizRequest):
     enforce_rate_limit(request.user_id)
 
-    chunks = fetch_document_chunks(request.document_id, limit=40)
+    chunks = fetch_document_chunks(request.document_id, limit=60)
     if not chunks:
         raise HTTPException(
             status_code=400,
             detail="This document has no readable content to quiz on.",
         )
 
+    # Sample/shuffle chunks so repeated quizzes on the same document draw from
+    # different parts and don't feel like the same set of questions.
+    if len(chunks) > 40:
+        chunks = random.sample(chunks, 40)
+    else:
+        random.shuffle(chunks)
+
     content = "\n\n".join(chunks)
-    n = max(1, min(request.num_questions, 15))
+    n = max(1, min(request.num_questions, 30))
 
     prompt = f"""You are an expert exam question writer helping a college student prepare for exams.
 Write {n} multiple-choice questions based on the study material below.
